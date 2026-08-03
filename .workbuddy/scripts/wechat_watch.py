@@ -30,9 +30,28 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 POOL = Path(__file__).resolve().parents[2] / "40_资料库/游戏发行与广告/公众号专题/持续关注公众号池.md"
+
+# 分账号备用数据源（2026-08-03 实测后接入）。
+# 背景：搜狗对账号的覆盖是幸存者偏差——王董近一月约 7 篇搜狗只命中 1 篇，
+# 曾嵘 7 月 4 篇搜狗 0 篇。对这类账号在搜狗之外叠加备用入口，按标题合并去重。
+# 新增入口时在此登记，并在「持续关注公众号池.md」的检索入口一节同步记录。
+EXTRA_SOURCES = {
+    "王董的新游戏": {
+        "type": "jintiankansha",
+        "url": "https://www.jintiankansha.com/column/yiKLO5DWpr",
+        # 今日看啥只给相对日期（N 周前/个月前），日期为换算约值，归档时需标注口径。
+    },
+    "曾嵘胡扯的地方": {
+        "type": "rss",
+        "url": "https://blog.zengrong.net/index.xml",
+        # 作者博客与公众号同源，RSS 有准确发布日期，实测 7 月 4 篇全部命中。
+    },
+}
 
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -69,11 +88,17 @@ def normalize_title(title: str) -> str:
 
 
 def load_archived_titles(topic_dir: Path) -> set:
-    """收集专题目录下已归档的文章标题，避免重复登记。"""
+    """收集专题目录下已归档的文章标题，避免重复登记。
+
+    排除以日期开头的执行报告类文件：报告会提及当轮检出的标题，
+    若计入已归档集合，会出现"被报告提及=已归档"的假阳性，
+    导致真实未入档的文章被错误拦截（2026-08-03 王董案例实测）。"""
     titles = set()
     if not topic_dir.exists():
         return titles
     for md in topic_dir.glob("*.md"):
+        if re.match(r"^\d{4}-\d{2}-\d{2}-", md.name):
+            continue
         text = md.read_text(encoding="utf-8", errors="ignore")
         # 表格单元格内的链接标题与纯文本标题
         for m in re.finditer(r"\[([^\]]{6,})\]\(", text):
@@ -162,6 +187,71 @@ def search(keyword: str, page: int = 1) -> list:
     return items
 
 
+def fetch_rss(url: str) -> list:
+    """解析 RSS item，返回 [{title, date, url, source}]。日期为准确值。
+
+    用正则而非 ElementTree：实测部分博客 RSS 内容含未转义字符，
+    严格 XML 解析会整体失败。只提取 title/link/pubDate 三个字段。
+    """
+    raw = fetch(url)
+    items = []
+    for block in re.findall(r"<item>(.*?)</item>", raw, re.S):
+        def field(tag: str) -> str:
+            m = re.search(rf"<{tag}>(.*?)</{tag}>", block, re.S)
+            if not m:
+                return ""
+            return clean(re.sub(r"<!\[CDATA\[|\]\]>", "", m.group(1)))
+        title, link, pub = field("title"), field("link"), field("pubDate")
+        date = ""
+        if pub:
+            try:
+                date = parsedate_to_datetime(pub).date().isoformat()
+            except (TypeError, ValueError):
+                pass
+        if title:
+            items.append({"title": title, "date": date, "url": link,
+                          "summary": "", "source": "rss", "date_approx": False})
+    return items
+
+
+def fetch_jintiankansha(url: str) -> list:
+    """解析今日看啥专栏页文章列表。
+
+    结构：每个条目以 <span class="item_title"> 开头，块内 hide-content 依次是
+    标题、账号名，后跟相对日期「N 小时/天/周/个月前」。只有相对日期，
+    换算成绝对日期是约值（date_approx=True），归档时必须标注口径。
+    """
+    content = fetch(url)
+    today = dt.date.today()
+    items = []
+    for chunk in content.split('<span class="item_title">')[1:]:
+        spans = re.findall(r'<span class="hide-content">(.*?)</span>', chunk, re.S)
+        # 条目标题有两种形态：无链接的在 hide-content 里，有链接的直接是 <a>标题</a>。
+        m_link = re.search(r'<a target="_blank" href="(http[^"]*/t/[^"]+)">(.*?)</a>', chunk, re.S)
+        if m_link:
+            title, link = clean(m_link.group(2)), m_link.group(1)
+            account = clean(spans[0]) if spans else ""
+        else:
+            if len(spans) < 2:
+                continue
+            title, account = clean(spans[0]), clean(spans[1])
+            lm = re.search(r'href="(/t/[^"]+)"', chunk)
+            link = "https://www.jintiankansha.com" + lm.group(1) if lm else ""
+        # 相对日期实测形态：「N 小时前 / N 天前 / N 周前 / N 月前」（注意是"月前"不是"个月前"）。
+        ago = re.search(r"(\d+)\s*(周|个?月|天|小时)前", chunk)
+        if not ago or not title:
+            continue
+        n, unit = int(ago.group(1)), ago.group(2)
+        days = {"小时": 0, "天": n, "周": 7 * n, "月": 30 * n, "个月": 30 * n}[unit]
+        date = (today - dt.timedelta(days=days)).isoformat()
+        items.append({"title": title, "account": account, "date": date, "url": link,
+                      "summary": "", "source": "jintiankansha", "date_approx": True})
+    return items
+
+
+EXTRA_FETCHERS = {"rss": fetch_rss, "jintiankansha": fetch_jintiankansha}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", help="统一起始日期 YYYY-MM-DD，默认用池中各账号的最近检查日期")
@@ -185,7 +275,7 @@ def main():
         default_since = args.since
 
     print(f"# 公众号增量检查 {today.isoformat()}\n")
-    print(f"检查账号 {len(accounts)} 个，数据源 搜狗微信全量检索\n")
+    print(f"检查账号 {len(accounts)} 个，数据源 搜狗微信全量检索 + 分账号备用入口（今日看啥/RSS）\n")
 
     report, hits, misses = [], 0, 0
 
@@ -200,17 +290,34 @@ def main():
                     for art in search(acc["name"], page):
                         if art["date"] <= since:
                             continue
+                        art.setdefault("source", "sogou")
+                        art.setdefault("date_approx", False)
                         # 账号名精确过滤：搜狗是关键词检索，会混入无关账号。
                         # 命中本账号 -> 计入增量；未命中但在窗口内 -> 记为他人转载线索。
                         if art["account"] in names:
                             art["already_archived"] = normalize_title(art["title"]) in archived
-                            collected[art["title"]] = art
+                            collected[normalize_title(art["title"])] = art
                         else:
                             reprints[art["title"]] = art
                 except RuntimeError as exc:
                     errors.append(str(exc))
                     break
                 time.sleep(1.5 + random.random() * 1.5)
+
+        # 备用数据源：搜狗覆盖差的账号，叠加今日看啥/RSS 等入口，按标准化标题合并去重。
+        extra = EXTRA_SOURCES.get(acc["name"])
+        if extra:
+            try:
+                for art in EXTRA_FETCHERS[extra["type"]](extra["url"]):
+                    if not art["date"] or art["date"] <= since:
+                        continue
+                    # 专栏页可能混入非本账号条目，账号名不符则跳过（RSS 无账号字段则不校验）。
+                    if art.get("account") and art["account"] not in names:
+                        continue
+                    art["already_archived"] = normalize_title(art["title"]) in archived
+                    collected.setdefault(normalize_title(art["title"]), art)
+            except Exception as exc:
+                errors.append(f"{extra['type']} 抓取失败: {exc}")
 
         all_found = sorted(collected.values(), key=lambda x: x["date"], reverse=True)
         found = [a for a in all_found if not a.get("already_archived")]
@@ -238,7 +345,10 @@ def main():
         print(f"窗口 {since} 之后 · {status}")
         if found:
             for art in found:
-                print(f"- {art['date']} 「{art['title']}」")
+                src = {"sogou": "搜狗", "rss": "RSS", "jintiankansha": "今日看啥"}.get(
+                    art.get("source", "sogou"), art.get("source", "搜狗"))
+                approx = "（日期为相对口径换算约值）" if art.get("date_approx") else ""
+                print(f"- {art['date']} 「{art['title']}」 [{src}]{approx}")
                 if art["summary"]:
                     print(f"  摘要: {art['summary']}")
                 if art["url"]:
